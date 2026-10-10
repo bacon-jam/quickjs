@@ -37,6 +37,13 @@
 #elif defined(__linux__)
 #include <malloc.h>
 #endif
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#else
+#include <sys/mman.h>
+#include <sys/stat.h>
+#endif
 
 #include "cutils.h"
 #include "quickjs-libc.h"
@@ -280,6 +287,167 @@ static const JSMallocFunctions trace_mf = {
 
 #define PROG_NAME "qjs"
 
+/* REPRL and coverage support for Fuzzilli. */
+
+#define CHECK(cond) do {                                  \
+    if (!(cond)) {                                        \
+        fprintf(stderr, "\"" #cond "\" failed\n");       \
+        _exit(-1);                                        \
+    }                                                     \
+} while (0)
+
+#ifdef _WIN32
+static int reprl_crfd = -1;
+static int reprl_cwfd = -1;
+static int reprl_drfd = -1;
+
+static int reprl_open_channel(const char *name, int flags)
+{
+    const char *value = getenv(name);
+    char *end;
+    unsigned long long handle;
+
+    if (!value || !*value)
+        return -1;
+    errno = 0;
+    handle = strtoull(value, &end, 10);
+    if (errno || *end || handle > UINTPTR_MAX || !handle)
+        return -1;
+    return _open_osfhandle((intptr_t)(uintptr_t)handle, flags | _O_BINARY);
+}
+
+static void reprl_open_channels(void)
+{
+    reprl_crfd = reprl_open_channel("FUZZILLI_REPRL_CRFD", _O_RDONLY);
+    reprl_cwfd = reprl_open_channel("FUZZILLI_REPRL_CWFD", _O_WRONLY);
+    reprl_drfd = reprl_open_channel("FUZZILLI_REPRL_DRFD", _O_RDONLY);
+    CHECK(reprl_crfd >= 0 && reprl_cwfd >= 0 && reprl_drfd >= 0);
+}
+
+#define REPRL_CRFD reprl_crfd
+#define REPRL_CWFD reprl_cwfd
+#define REPRL_DRFD reprl_drfd
+#define reprl_read _read
+#define reprl_write _write
+#else
+#define REPRL_CRFD 100
+#define REPRL_CWFD 101
+#define REPRL_DRFD 102
+#define reprl_read read
+#define reprl_write write
+#endif
+
+#define SHM_SIZE 0x200000
+#define MAX_EDGES ((SHM_SIZE - 4) * 8)
+
+struct shmem_data {
+    uint32_t num_edges;
+    unsigned char edges[];
+};
+
+struct shmem_data *__shmem;
+uint32_t *__edges_start, *__edges_stop;
+static int reprl_unhandled_rejections;
+
+static void reprl_promise_rejection_tracker(JSContext *ctx, JSValueConst promise,
+                                            JSValueConst reason, BOOL is_handled,
+                                            void *opaque)
+{
+    (void)ctx;
+    (void)promise;
+    (void)reason;
+    (void)opaque;
+    if (is_handled) {
+        if (reprl_unhandled_rejections > 0)
+            reprl_unhandled_rejections--;
+    } else {
+        reprl_unhandled_rejections++;
+    }
+}
+
+void __sanitizer_cov_reset_edgeguards(void)
+{
+    uint64_t next_edge = 0;
+    uint32_t *guard;
+
+    for (guard = __edges_start;
+         guard < __edges_stop && next_edge < MAX_EDGES - 1; guard++)
+        *guard = ++next_edge;
+}
+
+void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop)
+{
+    const char *shm_key;
+
+    /* Avoid duplicate initialization. */
+    if (start == stop || *start)
+        return;
+
+    if (__edges_start != NULL || __edges_stop != NULL) {
+        fprintf(stderr, "Coverage instrumentation is only supported for a single module\n");
+        _exit(-1);
+    }
+
+    __edges_start = start;
+    __edges_stop = stop;
+
+    /* Map the shared memory region. */
+    shm_key = getenv("SHM_ID");
+    if (!shm_key) {
+        __shmem = (struct shmem_data *)calloc(1, SHM_SIZE);
+        if (!__shmem)
+            _exit(-1);
+    } else {
+#ifdef _WIN32
+        HANDLE mapping = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, shm_key);
+        if (!mapping) {
+            fprintf(stderr, "Failed to open shared memory region: %lu\n", GetLastError());
+            _exit(-1);
+        }
+        __shmem = (struct shmem_data *)MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS,
+                                                     0, 0, SHM_SIZE);
+        CloseHandle(mapping);
+        if (!__shmem) {
+            fprintf(stderr, "Failed to map shared memory region: %lu\n", GetLastError());
+            _exit(-1);
+        }
+#else
+        int fd = shm_open(shm_key, O_RDWR, S_IREAD | S_IWRITE);
+        if (fd <= -1) {
+            fprintf(stderr, "Failed to open shared memory region: %s\n", strerror(errno));
+            _exit(-1);
+        }
+
+        __shmem = (struct shmem_data *)mmap(0, SHM_SIZE, PROT_READ | PROT_WRITE,
+                                            MAP_SHARED, fd, 0);
+        close(fd);
+        if (__shmem == MAP_FAILED) {
+            fprintf(stderr, "Failed to mmap shared memory region\n");
+            _exit(-1);
+        }
+#endif
+    }
+
+    __sanitizer_cov_reset_edgeguards();
+
+    __shmem->num_edges = stop - start < MAX_EDGES ? stop - start
+                                                  : MAX_EDGES - 1;
+}
+
+void __sanitizer_cov_trace_pc_guard(uint32_t *guard)
+{
+    uint32_t index = *guard;
+
+    /* There is a small race if two threads execute the same edge at once:
+       one may clear the guard before the other reads it. The first edge is
+       ignored by libcoverage.c, so this does not affect coverage. */
+    /* Ignore calls before coverage instrumentation is initialized. */
+    if (!index)
+        return;
+    __shmem->edges[index / 8] |= 1 << (index % 8);
+    *guard = 0;
+}
+
 void help(void)
 {
     printf("QuickJS version " CONFIG_VERSION "\n"
@@ -325,6 +493,9 @@ int main(int argc, char **argv)
     int load_jscalc;
 #endif
     size_t stack_size = 0;
+    BOOL reprl_mode = FALSE;
+    int status = 0;
+    int result = EXIT_SUCCESS;
     
 #ifdef CONFIG_BIGNUM
     /* load jscalc runtime if invoked as 'qjscalc' */
@@ -445,12 +616,34 @@ int main(int argc, char **argv)
                 stack_size = (size_t)strtod(argv[optind++], NULL);
                 continue;
             }
+            if (opt == 'r' || !strcmp(longopt, "reprl")) {
+                reprl_mode = TRUE;
+                continue;
+            }
             if (opt) {
                 fprintf(stderr, "qjs: unknown option '-%c'\n", opt);
             } else {
                 fprintf(stderr, "qjs: unknown option '--%s'\n", longopt);
             }
             help();
+        }
+    }
+
+    if (reprl_mode) {
+        char helo[] = "HELO";
+
+#ifdef _WIN32
+        reprl_open_channels();
+        SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
+#endif
+        if (reprl_write(REPRL_CWFD, helo, 4) != 4 || reprl_read(REPRL_CRFD, helo, 4) != 4) {
+            printf("Invalid HELO response from parent\n");
+            reprl_mode = FALSE;
+        }
+
+        if (memcmp(helo, "HELO", 4) != 0) {
+            printf("Invalid response from parent\n");
+            _exit(-1);
         }
     }
 
@@ -482,7 +675,9 @@ int main(int argc, char **argv)
     /* loader for ES6 modules */
     JS_SetModuleLoaderFunc(rt, NULL, js_module_loader, NULL);
 
-    if (dump_unhandled_promise_rejection) {
+    if (reprl_mode) {
+        JS_SetHostPromiseRejectionTracker(rt, reprl_promise_rejection_tracker, NULL);
+    } else if (dump_unhandled_promise_rejection) {
         JS_SetHostPromiseRejectionTracker(rt, js_std_promise_rejection_tracker,
                                           NULL);
     }
@@ -509,23 +704,105 @@ int main(int argc, char **argv)
                 goto fail;
         }
 
-        if (expr) {
-            if (eval_buf(ctx, expr, strlen(expr), "<cmdline>", 0))
-                goto fail;
-        } else
-        if (optind >= argc) {
-            /* interactive mode */
-            interactive = 1;
+        if (reprl_mode) {
+            do {
+                uint64_t wire_script_size = 0;
+                size_t script_size, remaining;
+                char action[4];
+                char *script_src, *ptr;
+
+                CHECK(reprl_read(REPRL_CRFD, action, 4) == 4);
+                if (!memcmp(action, "exec", 4)) {
+                    CHECK(reprl_read(REPRL_CRFD, &wire_script_size, 8) == 8);
+                } else {
+                    fprintf(stderr, "Unknown REPRL action\n");
+                    _exit(-1);
+                }
+                CHECK(wire_script_size <= 0x1000000);
+                script_size = (size_t)wire_script_size;
+                script_src = js_malloc(ctx, script_size + 1);
+                CHECK(script_src != NULL);
+
+#ifdef _WIN32
+                CHECK(_lseeki64(REPRL_DRFD, 0, SEEK_SET) == 0);
+#endif
+                ptr = script_src;
+                remaining = script_size;
+                while (remaining > 0) {
+                    int rv = reprl_read(REPRL_DRFD, ptr, remaining);
+                    if (rv <= 0) {
+                        fprintf(stderr, "Failed to load script\n");
+                        _exit(-1);
+                    }
+                    remaining -= rv;
+                    ptr += rv;
+                }
+                script_src[script_size] = '\0';
+                reprl_unhandled_rejections = 0;
+                if ((result = eval_buf(ctx, script_src, script_size, "reprl", 0)) == 0) {
+                    js_std_loop(ctx);
+                    if (reprl_unhandled_rejections)
+                        result = -1;
+                } else {
+                    fprintf(stderr, "Failed to eval_buf reprl\n");
+                }
+                js_free(ctx, script_src);
+                js_std_free_handlers(rt);
+                JS_FreeContext(ctx);
+                JS_FreeRuntime(rt);
+
+                /* Each execution starts with a fresh global object and heap. */
+                rt = trace_memory ? JS_NewRuntime2(&trace_mf, &trace_data) : JS_NewRuntime();
+                CHECK(rt != NULL);
+                if (memory_limit != 0)
+                    JS_SetMemoryLimit(rt, memory_limit);
+                if (stack_size != 0)
+                    JS_SetMaxStackSize(rt, stack_size);
+                js_std_init_handlers(rt);
+                ctx = JS_NewCustomContext(rt);
+                CHECK(ctx != NULL);
+                JS_SetModuleLoaderFunc(rt, NULL, js_module_loader, NULL);
+                JS_SetHostPromiseRejectionTracker(rt, reprl_promise_rejection_tracker, NULL);
+#ifdef CONFIG_BIGNUM
+                if (load_jscalc)
+                    js_std_eval_binary(ctx, qjsc_qjscalc, qjsc_qjscalc_size, 0);
+#endif
+                js_std_add_helpers(ctx, argc - optind, argv + optind);
+                if (load_std) {
+                    const char *str = "import * as std from 'std';\n"
+                        "import * as os from 'os';\n"
+                        "globalThis.std = std;\n"
+                        "globalThis.os = os;\n";
+                    CHECK(eval_buf(ctx, str, strlen(str), "<input>", JS_EVAL_TYPE_MODULE) == 0);
+                }
+                for (i = 0; i < include_count; i++)
+                    CHECK(eval_file(ctx, include_list[i], module) == 0);
+                fflush(stdout);
+                fflush(stderr);
+                /* Send the return code to the parent and reset edge counters. */
+                status = (result & 0xff) << 8;
+                CHECK(reprl_write(REPRL_CWFD, &status, 4) == 4);
+                __sanitizer_cov_reset_edgeguards();
+            } while (reprl_mode);
         } else {
-            const char *filename;
-            filename = argv[optind];
-            if (eval_file(ctx, filename, module))
-                goto fail;
+            if (expr) {
+                if (eval_buf(ctx, expr, strlen(expr), "<cmdline>", 0))
+                    goto fail;
+            } else
+            if (optind >= argc) {
+                /* interactive mode */
+                interactive = 1;
+            } else {
+                const char *filename;
+                filename = argv[optind];
+                if (eval_file(ctx, filename, module))
+                    goto fail;
+            }
+            if (interactive) {
+                js_std_eval_binary(ctx, qjsc_repl, qjsc_repl_size, 0);
+            }
+            js_std_loop(ctx);
         }
-        if (interactive) {
-            js_std_eval_binary(ctx, qjsc_repl, qjsc_repl_size, 0);
-        }
-        js_std_loop(ctx);
     }
     
     if (dump_memory) {

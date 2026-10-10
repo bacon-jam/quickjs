@@ -34,11 +34,9 @@ CONFIG_LTO=y
 # force 32 bit build for some utilities
 #CONFIG_M32=y
 
-ifdef CONFIG_DARWIN
-# use clang instead of gcc
+# use clang for sanitizer coverage
 CONFIG_CLANG=y
 CONFIG_DEFAULT_AR=y
-endif
 
 # installation directory
 prefix=/usr/local
@@ -74,6 +72,7 @@ ifdef CONFIG_CLANG
   CFLAGS += -Wunused -Wno-unused-parameter
   CFLAGS += -Wwrite-strings
   CFLAGS += -Wchar-subscripts -funsigned-char
+  CFLAGS += -fsanitize-coverage=trace-pc-guard
   CFLAGS += -MMD -MF $(OBJDIR)/$(@F).d
   ifdef CONFIG_DEFAULT_AR
     AR=$(CROSS_PREFIX)ar
@@ -112,7 +111,7 @@ CFLAGS_DEBUG=$(CFLAGS) -O0
 CFLAGS_SMALL=$(CFLAGS) -Os
 CFLAGS_OPT=$(CFLAGS) -O2
 CFLAGS_NOLTO:=$(CFLAGS_OPT)
-LDFLAGS=-g
+LDFLAGS=-g -fsanitize-coverage=trace-pc-guard
 ifdef CONFIG_LTO
 CFLAGS_SMALL+=-flto
 CFLAGS_OPT+=-flto
@@ -169,6 +168,10 @@ all: $(OBJDIR) $(OBJDIR)/quickjs.check.o $(OBJDIR)/qjs.check.o $(PROGS)
 QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o
 
 QJS_OBJS=$(OBJDIR)/qjs.o $(OBJDIR)/repl.o $(QJS_LIB_OBJS)
+QJSC_LIB_OBJS=$(patsubst %.o, %.tool.o, $(QJS_LIB_OBJS))
+ifdef CONFIG_WIN32
+QJS_OBJS+=$(OBJDIR)/fuzzilli-coverage-coff.tool.o
+endif
 ifdef CONFIG_BIGNUM
 QJS_LIB_OBJS+=$(OBJDIR)/libbf.o 
 QJS_OBJS+=$(OBJDIR)/qjscalc.o
@@ -190,7 +193,7 @@ qjs$(EXE): $(QJS_OBJS)
 qjs-debug$(EXE): $(patsubst %.o, %.debug.o, $(QJS_OBJS))
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-qjsc$(EXE): $(OBJDIR)/qjsc.o $(QJS_LIB_OBJS)
+qjsc$(EXE): $(OBJDIR)/qjsc.tool.o $(QJSC_LIB_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 ifneq ($(CROSS_PREFIX),)
@@ -208,6 +211,7 @@ endif
 QJSC_HOST_DEFINES:=-DCONFIG_CC=\"$(HOST_CC)\" -DCONFIG_PREFIX=\"$(prefix)\"
 
 $(OBJDIR)/qjsc.o: CFLAGS+=$(QJSC_DEFINES)
+$(OBJDIR)/qjsc.tool.o: CFLAGS+=$(QJSC_DEFINES)
 $(OBJDIR)/qjsc.host.o: CFLAGS+=$(QJSC_HOST_DEFINES)
 
 qjs32: $(patsubst %.o, %.m32.o, $(QJS_OBJS))
@@ -262,8 +266,11 @@ run-test262-32: $(patsubst %.o, %.m32.o, $(OBJDIR)/run-test262.o $(QJS_LIB_OBJS)
 $(OBJDIR)/%.o: %.c | $(OBJDIR)
 	$(CC) $(CFLAGS_OPT) -c -o $@ $<
 
+$(OBJDIR)/%.tool.o: %.c | $(OBJDIR)
+	$(CC) $(CFLAGS_OPT) -fno-sanitize-coverage=trace-pc-guard -c -o $@ $<
+
 $(OBJDIR)/%.host.o: %.c | $(OBJDIR)
-	$(HOST_CC) $(CFLAGS_OPT) -c -o $@ $<
+	$(HOST_CC) $(CFLAGS_OPT) -fno-sanitize-coverage=trace-pc-guard -c -o $@ $<
 
 $(OBJDIR)/%.pic.o: %.c | $(OBJDIR)
 	$(CC) $(CFLAGS_OPT) -fPIC -DJS_SHARED_LIBRARY -c -o $@ $<

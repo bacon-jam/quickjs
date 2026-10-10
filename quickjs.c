@@ -28,10 +28,15 @@
 #include <inttypes.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
 #include <sys/time.h>
 #include <time.h>
 #include <fenv.h>
 #include <math.h>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
 #elif defined(__linux__)
@@ -35408,6 +35413,81 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     return JS_EXCEPTION;
 }
 
+static FILE *fuzzilli_output(void)
+{
+    static FILE *output;
+#ifdef _WIN32
+    const char *value;
+#endif
+
+    if (output)
+        return output;
+#ifdef _WIN32
+    value = getenv("FUZZILLI_REPRL_DWFD");
+    if (value && *value) {
+        char *end;
+        unsigned long long handle;
+        errno = 0;
+        handle = strtoull(value, &end, 10);
+        if (!errno && !*end && handle && handle <= UINTPTR_MAX) {
+            int fd = _open_osfhandle((intptr_t)(uintptr_t)handle, _O_WRONLY | _O_BINARY);
+            if (fd >= 0) {
+                output = _fdopen(fd, "wb");
+                if (!output)
+                    _close(fd);
+            }
+        }
+    }
+#else
+    output = fdopen(103, "w");
+#endif
+    if (!output) {
+        fprintf(stderr, "Fuzzer output channel not available, printing to stdout instead\n");
+        output = stdout;
+    }
+    return output;
+}
+
+static JSValue js_fuzzilli(JSContext *ctx, JSValueConst this_val, int argc,
+                           JSValueConst *argv)
+{
+    const char *str;
+
+    if (argc < 1)
+        return JS_FALSE;
+    str = JS_ToCString(ctx, argv[0]);
+    if (!str)
+        return JS_FALSE;
+    if (!strcmp(str, "FUZZILLI_CRASH")) {
+        int type;
+        if (argc < 2 || JS_ToInt32(ctx, &type, argv[1])) {
+            JS_FreeCString(ctx, str);
+            return JS_FALSE;
+        }
+        switch (type) {
+        case 0:
+            *((int *)0x41414141) = 0x1337;
+            break;
+        case 1:
+            assert(0);
+            break;
+        default:
+            assert(0);
+            break;
+        }
+    } else if (!strcmp(str, "FUZZILLI_PRINT") && argc > 1) {
+        FILE *fzliout = fuzzilli_output();
+        const char *print_str = JS_ToCString(ctx, argv[1]);
+        if (print_str) {
+            fprintf(fzliout, "%s\n", print_str);
+            JS_FreeCString(ctx, print_str);
+        }
+        fflush(fzliout);
+    }
+    JS_FreeCString(ctx, str);
+    return JS_TRUE;
+}
+
 static JSValue JS_ReadModule(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
@@ -47856,6 +47936,7 @@ static JSValue js_global_unescape(JSContext *ctx, JSValueConst this_val,
 
 static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("parseInt", 2, js_parseInt ),
+    JS_CFUNC_DEF("fuzzilli", 2, js_fuzzilli),
     JS_CFUNC_DEF("parseFloat", 1, js_parseFloat ),
     JS_CFUNC_DEF("isNaN", 1, js_global_isNaN ),
     JS_CFUNC_DEF("isFinite", 1, js_global_isFinite ),

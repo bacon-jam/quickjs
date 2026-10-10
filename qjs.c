@@ -292,7 +292,7 @@ static const JSMallocFunctions trace_mf = {
 #define CHECK(cond) do {                                  \
     if (!(cond)) {                                        \
         fprintf(stderr, "\"" #cond "\" failed\n");       \
-        _exit(-1);                                        \
+        _exit(EXIT_FAILURE);                              \
     }                                                     \
 } while (0)
 
@@ -347,22 +347,58 @@ struct shmem_data {
 
 struct shmem_data *__shmem;
 uint32_t *__edges_start, *__edges_stop;
-static int reprl_unhandled_rejections;
+
+typedef struct ReprlRejectedPromise {
+    JSValue promise;
+    struct ReprlRejectedPromise *next;
+} ReprlRejectedPromise;
+
+static ReprlRejectedPromise *reprl_rejected_promises;
+static BOOL reprl_track_rejections;
+static BOOL reprl_rejection_tracking_failed;
 
 static void reprl_promise_rejection_tracker(JSContext *ctx, JSValueConst promise,
                                             JSValueConst reason, BOOL is_handled,
                                             void *opaque)
 {
-    (void)ctx;
-    (void)promise;
+    ReprlRejectedPromise **pp, *p;
+
     (void)reason;
     (void)opaque;
+    if (!reprl_track_rejections)
+        return;
     if (is_handled) {
-        if (reprl_unhandled_rejections > 0)
-            reprl_unhandled_rejections--;
+        for (pp = &reprl_rejected_promises; (p = *pp) != NULL; pp = &p->next) {
+            if (JS_VALUE_GET_PTR(p->promise) == JS_VALUE_GET_PTR(promise)) {
+                *pp = p->next;
+                JS_FreeValue(ctx, p->promise);
+                js_free(ctx, p);
+                break;
+            }
+        }
     } else {
-        reprl_unhandled_rejections++;
+        p = js_malloc(ctx, sizeof(*p));
+        if (!p) {
+            reprl_rejection_tracking_failed = TRUE;
+            return;
+        }
+        p->promise = JS_DupValue(ctx, promise);
+        p->next = reprl_rejected_promises;
+        reprl_rejected_promises = p;
     }
+}
+
+static void reprl_clear_rejected_promises(JSContext *ctx)
+{
+    ReprlRejectedPromise *p, *next;
+
+    for (p = reprl_rejected_promises; p != NULL; p = next) {
+        next = p->next;
+        JS_FreeValue(ctx, p->promise);
+        js_free(ctx, p);
+    }
+    reprl_rejected_promises = NULL;
+    reprl_rejection_tracking_failed = FALSE;
 }
 
 void __sanitizer_cov_reset_edgeguards(void)
@@ -385,7 +421,7 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop)
 
     if (__edges_start != NULL || __edges_stop != NULL) {
         fprintf(stderr, "Coverage instrumentation is only supported for a single module\n");
-        _exit(-1);
+        _exit(EXIT_FAILURE);
     }
 
     __edges_start = start;
@@ -396,26 +432,26 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop)
     if (!shm_key) {
         __shmem = (struct shmem_data *)calloc(1, SHM_SIZE);
         if (!__shmem)
-            _exit(-1);
+            _exit(EXIT_FAILURE);
     } else {
 #ifdef _WIN32
         HANDLE mapping = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, shm_key);
         if (!mapping) {
             fprintf(stderr, "Failed to open shared memory region: %lu\n", GetLastError());
-            _exit(-1);
+            _exit(EXIT_FAILURE);
         }
         __shmem = (struct shmem_data *)MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS,
                                                      0, 0, SHM_SIZE);
         CloseHandle(mapping);
         if (!__shmem) {
             fprintf(stderr, "Failed to map shared memory region: %lu\n", GetLastError());
-            _exit(-1);
+            _exit(EXIT_FAILURE);
         }
 #else
         int fd = shm_open(shm_key, O_RDWR, S_IREAD | S_IWRITE);
         if (fd <= -1) {
             fprintf(stderr, "Failed to open shared memory region: %s\n", strerror(errno));
-            _exit(-1);
+            _exit(EXIT_FAILURE);
         }
 
         __shmem = (struct shmem_data *)mmap(0, SHM_SIZE, PROT_READ | PROT_WRITE,
@@ -423,7 +459,7 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop)
         close(fd);
         if (__shmem == MAP_FAILED) {
             fprintf(stderr, "Failed to mmap shared memory region\n");
-            _exit(-1);
+            _exit(EXIT_FAILURE);
         }
 #endif
     }
@@ -643,7 +679,7 @@ int main(int argc, char **argv)
 
         if (memcmp(helo, "HELO", 4) != 0) {
             printf("Invalid response from parent\n");
-            _exit(-1);
+            _exit(EXIT_FAILURE);
         }
     }
 
@@ -716,7 +752,7 @@ int main(int argc, char **argv)
                     CHECK(reprl_read(REPRL_CRFD, &wire_script_size, 8) == 8);
                 } else {
                     fprintf(stderr, "Unknown REPRL action\n");
-                    _exit(-1);
+                    _exit(EXIT_FAILURE);
                 }
                 CHECK(wire_script_size <= 0x1000000);
                 script_size = (size_t)wire_script_size;
@@ -732,20 +768,22 @@ int main(int argc, char **argv)
                     int rv = reprl_read(REPRL_DRFD, ptr, remaining);
                     if (rv <= 0) {
                         fprintf(stderr, "Failed to load script\n");
-                        _exit(-1);
+                        _exit(EXIT_FAILURE);
                     }
                     remaining -= rv;
                     ptr += rv;
                 }
                 script_src[script_size] = '\0';
-                reprl_unhandled_rejections = 0;
+                reprl_track_rejections = TRUE;
                 if ((result = eval_buf(ctx, script_src, script_size, "reprl", 0)) == 0) {
                     js_std_loop(ctx);
-                    if (reprl_unhandled_rejections)
+                    if (reprl_rejected_promises || reprl_rejection_tracking_failed)
                         result = -1;
                 } else {
                     fprintf(stderr, "Failed to eval_buf reprl\n");
                 }
+                reprl_track_rejections = FALSE;
+                reprl_clear_rejected_promises(ctx);
                 js_free(ctx, script_src);
                 js_std_free_handlers(rt);
                 JS_FreeContext(ctx);

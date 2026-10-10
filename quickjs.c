@@ -28,7 +28,6 @@
 #include <inttypes.h>
 #include <string.h>
 #include <assert.h>
-#include <errno.h>
 #include <sys/time.h>
 #include <time.h>
 #include <fenv.h>
@@ -35457,12 +35456,16 @@ static JSValue js_fuzzilli(JSContext *ctx, JSValueConst this_val, int argc,
         return JS_FALSE;
     str = JS_ToCString(ctx, argv[0]);
     if (!str)
-        return JS_FALSE;
+        return JS_EXCEPTION;
     if (!strcmp(str, "FUZZILLI_CRASH")) {
         int type;
-        if (argc < 2 || JS_ToInt32(ctx, &type, argv[1])) {
+        if (argc < 2) {
             JS_FreeCString(ctx, str);
             return JS_FALSE;
+        }
+        if (JS_ToInt32(ctx, &type, argv[1])) {
+            JS_FreeCString(ctx, str);
+            return JS_EXCEPTION;
         }
         switch (type) {
         case 0:
@@ -35478,10 +35481,12 @@ static JSValue js_fuzzilli(JSContext *ctx, JSValueConst this_val, int argc,
     } else if (!strcmp(str, "FUZZILLI_PRINT") && argc > 1) {
         FILE *fzliout = fuzzilli_output();
         const char *print_str = JS_ToCString(ctx, argv[1]);
-        if (print_str) {
-            fprintf(fzliout, "%s\n", print_str);
-            JS_FreeCString(ctx, print_str);
+        if (!print_str) {
+            JS_FreeCString(ctx, str);
+            return JS_EXCEPTION;
         }
+        fprintf(fzliout, "%s\n", print_str);
+        JS_FreeCString(ctx, print_str);
         fflush(fzliout);
     }
     JS_FreeCString(ctx, str);

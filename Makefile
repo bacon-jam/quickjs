@@ -170,7 +170,7 @@ QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(
 QJS_OBJS=$(OBJDIR)/qjs.o $(OBJDIR)/repl.o $(QJS_LIB_OBJS)
 QJSC_LIB_OBJS=$(patsubst %.o, %.tool.o, $(QJS_LIB_OBJS))
 ifdef CONFIG_WIN32
-QJS_OBJS+=$(OBJDIR)/fuzzilli-coverage-coff.tool.o
+QJS_COVERAGE_OBJS=$(OBJDIR)/fuzzilli-coverage-coff.tool.o
 endif
 ifdef CONFIG_BIGNUM
 QJS_LIB_OBJS+=$(OBJDIR)/libbf.o 
@@ -187,10 +187,10 @@ LIBS+=$(EXTRA_LIBS)
 $(OBJDIR):
 	mkdir -p $(OBJDIR) $(OBJDIR)/examples $(OBJDIR)/tests
 
-qjs$(EXE): $(QJS_OBJS)
+qjs$(EXE): $(QJS_OBJS) $(QJS_COVERAGE_OBJS)
 	$(CC) $(LDFLAGS) $(LDEXPORT) -o $@ $^ $(LIBS)
 
-qjs-debug$(EXE): $(patsubst %.o, %.debug.o, $(QJS_OBJS))
+qjs-debug$(EXE): $(patsubst %.o, %.debug.o, $(QJS_OBJS)) $(QJS_COVERAGE_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 qjsc$(EXE): $(OBJDIR)/qjsc.tool.o $(QJSC_LIB_OBJS)
@@ -214,10 +214,10 @@ $(OBJDIR)/qjsc.o: CFLAGS+=$(QJSC_DEFINES)
 $(OBJDIR)/qjsc.tool.o: CFLAGS+=$(QJSC_DEFINES)
 $(OBJDIR)/qjsc.host.o: CFLAGS+=$(QJSC_HOST_DEFINES)
 
-qjs32: $(patsubst %.o, %.m32.o, $(QJS_OBJS))
+qjs32: $(patsubst %.o, %.m32.o, $(QJS_OBJS)) $(QJS_COVERAGE_OBJS)
 	$(CC) -m32 $(LDFLAGS) $(LDEXPORT) -o $@ $^ $(LIBS)
 
-qjs32_s: $(patsubst %.o, %.m32s.o, $(QJS_OBJS))
+qjs32_s: $(patsubst %.o, %.m32s.o, $(QJS_OBJS)) $(QJS_COVERAGE_OBJS)
 	$(CC) -m32 $(LDFLAGS) -o $@ $^ $(LIBS)
 	@size $@
 

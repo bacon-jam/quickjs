@@ -29,7 +29,9 @@
 #include <assert.h>
 #include <unistd.h>
 #include <errno.h>
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <sys/wait.h>
 #endif
 
@@ -241,7 +243,11 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
         namelist_add(&init_module_list, e->name, e->short_name, 0);
         /* create a dummy module */
         m = JS_NewCModule(ctx, module_name, js_module_dummy_init);
-    } else if (has_suffix(module_name, ".so")) {
+    } else if (has_suffix(module_name, ".so")
+#ifdef _WIN32
+               || has_suffix(module_name, ".dll")
+#endif
+               ) {
         fprintf(stderr, "Warning: binary module '%s' will be dynamically loaded\n", module_name);
         /* create a dummy module */
         m = JS_NewCModule(ctx, module_name, js_module_dummy_init);
@@ -332,6 +338,7 @@ static const char main_c_template1[] =
 
 static const char main_c_template2[] =
     "  js_std_loop(ctx);\n"
+    "  js_std_free_handlers(rt);\n"
     "  JS_FreeContext(ctx);\n"
     "  JS_FreeRuntime(rt);\n"
     "  return 0;\n"
@@ -374,8 +381,158 @@ void help(void)
     exit(1);
 }
 
-#if defined(CONFIG_CC) && !defined(_WIN32)
+#ifdef CONFIG_CC
 
+#ifdef _WIN32
+static char *append_quoted_arg(char *p, const char *arg)
+{
+    size_t n;
+
+    *p++ = '"';
+    while (*arg) {
+        n = 0;
+        while (*arg == '\\') {
+            n++;
+            arg++;
+        }
+        if (*arg == '"') {
+            while (n != 0) {
+                *p++ = '\\';
+                *p++ = '\\';
+                n--;
+            }
+            *p++ = '\\';
+            *p++ = *arg++;
+        } else {
+            if (!*arg)
+                n *= 2;
+            while (n != 0) {
+                *p++ = '\\';
+                n--;
+            }
+            if (*arg)
+                *p++ = *arg++;
+        }
+    }
+    *p++ = '"';
+    return p;
+}
+
+static char *get_compiler_path(const char *name)
+{
+    const char *search_path, *base, *p;
+    char *found, *path;
+    DWORD len, ret;
+    size_t name_len;
+
+    if (strpbrk(name, "\\/:")) {
+        name_len = strlen(name);
+        found = malloc(name_len + sizeof(".exe"));
+        if (!found)
+            return NULL;
+        memcpy(found, name, name_len + 1);
+        base = strrchr(name, '\\');
+        p = strrchr(name, '/');
+        if (p && (!base || p > base))
+            base = p;
+        if (!base)
+            base = name;
+        if (!strchr(base, '.'))
+            strcat(found, ".exe");
+    } else {
+        search_path = getenv("PATH");
+        if (!search_path || !*search_path)
+            return NULL;
+        len = SearchPathA(search_path, name, ".exe", 0, NULL, NULL);
+        if (!len)
+            return NULL;
+        found = malloc(len);
+        if (!found)
+            return NULL;
+        ret = SearchPathA(search_path, name, ".exe", len, found, NULL);
+        if (!ret || ret >= len) {
+            free(found);
+            return NULL;
+        }
+    }
+
+    len = GetFullPathNameA(found, 0, NULL, NULL);
+    if (!len) {
+        free(found);
+        return NULL;
+    }
+    path = malloc(len);
+    if (!path) {
+        free(found);
+        return NULL;
+    }
+    ret = GetFullPathNameA(found, len, path, NULL);
+    free(found);
+    if (!ret || ret >= len) {
+        free(path);
+        return NULL;
+    }
+    return path;
+}
+
+static int exec_cmd(char **argv)
+{
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    DWORD status;
+    char *path, *cmdline, *p;
+    size_t len, cmdline_len;
+    int i, ret;
+
+    path = get_compiler_path(argv[0]);
+    if (!path) {
+        fprintf(stderr, "%s: compiler not found\n", argv[0]);
+        return 1;
+    }
+
+    cmdline_len = 1;
+    for(i = 0; argv[i]; i++) {
+        len = strlen(argv[i]);
+        if (len > (SIZE_MAX - cmdline_len - 3) / 2) {
+            free(path);
+            return 1;
+        }
+        cmdline_len += 2 * len + 3;
+    }
+    cmdline = malloc(cmdline_len);
+    if (!cmdline) {
+        free(path);
+        return 1;
+    }
+    p = cmdline;
+    for(i = 0; argv[i]; i++) {
+        if (i != 0)
+            *p++ = ' ';
+        p = append_quoted_arg(p, argv[i]);
+    }
+    *p = '\0';
+
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    if (!CreateProcessA(path, cmdline, NULL, NULL, TRUE, 0,
+                        NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "%s: could not start compiler (%lu)\n",
+                argv[0], GetLastError());
+        ret = 1;
+    } else {
+        ret = 1;
+        if (WaitForSingleObject(pi.hProcess, INFINITE) != WAIT_FAILED &&
+            GetExitCodeProcess(pi.hProcess, &status)) {
+            ret = (int)status;
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    free(cmdline);
+    free(path);
+    return ret;
+}
+#else
 int exec_cmd(char **argv)
 {
     int pid, status, ret;
@@ -393,6 +550,7 @@ int exec_cmd(char **argv)
     }
     return WEXITSTATUS(status);
 }
+#endif
 
 static int output_executable(const char *out_filename, const char *cfilename,
                              BOOL use_lto, BOOL verbose, const char *exename)
@@ -402,10 +560,21 @@ static int output_executable(const char *out_filename, const char *cfilename,
     char libjsname[1024];
     char exe_dir[1024], inc_dir[1024], lib_dir[1024], buf[1024], *p;
     int ret;
+#ifdef _WIN32
+    char *import_arg = NULL;
+    size_t len, prefix_len;
+#endif
     
     /* get the directory of the executable */
     pstrcpy(exe_dir, sizeof(exe_dir), exename);
     p = strrchr(exe_dir, '/');
+#ifdef _WIN32
+    {
+        char *p1 = strrchr(exe_dir, '\\');
+        if (p1 && (!p || p1 > p))
+            p = p1;
+    }
+#endif
     if (p) {
         *p = '\0';
     } else {
@@ -443,14 +612,40 @@ static int output_executable(const char *out_filename, const char *cfilename,
     *arg++ = inc_dir;
     *arg++ = "-o";
     *arg++ = out_filename;
-    if (dynamic_export)
+    if (dynamic_export) {
+#ifdef _WIN32
+        *arg++ = "-Wl,--export-all-symbols";
+        /* A dynamic module must link against this executable's exports. */
+        prefix_len = sizeof("--out-implib=") - 1;
+        len = strlen(out_filename);
+        if (len >= 4 && !_stricmp(out_filename + len - 4, ".exe"))
+            len -= 4;
+        if (len > SIZE_MAX - prefix_len - sizeof(".dll.a")) {
+            unlink(cfilename);
+            return 1;
+        }
+        import_arg = malloc(prefix_len + len + sizeof(".dll.a"));
+        if (!import_arg) {
+            unlink(cfilename);
+            return 1;
+        }
+        memcpy(import_arg, "--out-implib=", prefix_len);
+        memcpy(import_arg + prefix_len, out_filename, len);
+        memcpy(import_arg + prefix_len + len, ".dll.a", sizeof(".dll.a"));
+        *arg++ = "-Xlinker";
+        *arg++ = import_arg;
+#else
         *arg++ = "-rdynamic";
+#endif
+    }
     *arg++ = cfilename;
     snprintf(libjsname, sizeof(libjsname), "%s/libquickjs%s%s.a",
              lib_dir, bn_suffix, lto_suffix);
     *arg++ = libjsname;
     *arg++ = "-lm";
+#ifndef _WIN32
     *arg++ = "-ldl";
+#endif
     *arg++ = "-lpthread";
     *arg = NULL;
     
@@ -462,6 +657,9 @@ static int output_executable(const char *out_filename, const char *cfilename,
     
     ret = exec_cmd((char **)argv);
     unlink(cfilename);
+#ifdef _WIN32
+    free(import_arg);
+#endif
     return ret;
 }
 #else
@@ -605,7 +803,11 @@ int main(int argc, char **argv)
 
     if (!out_filename) {
         if (output_type == OUTPUT_EXECUTABLE) {
+#ifdef _WIN32
+            out_filename = "a.exe";
+#else
             out_filename = "a.out";
+#endif
         } else {
             out_filename = "out.c";
         }

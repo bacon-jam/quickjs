@@ -115,8 +115,9 @@ function test_popen()
     /* test loadFile */
     assert(std.loadFile(fname), content);
     
-    /* execute the 'cat' shell command */
-    f = std.popen("cat " + fname, "r");
+    /* execute a shell command */
+    f = std.popen((os.platform == "win32" ? "cmd /c type " : "cat ") +
+                  fname, "r");
     str = f.readAsString();
     f.close();
 
@@ -143,7 +144,10 @@ function test_os()
 {
     var fd, fpath, fname, fdir, buf, buf2, i, files, err, fdate, st, link_path;
 
-    assert(os.isatty(0));
+    if (os.platform == "win32")
+        assert(typeof os.isatty(0), "boolean");
+    else
+        assert(os.isatty(0));
 
     fdir = "test_tmp_dir";
     fname = "tmp_file.txt";
@@ -159,6 +163,7 @@ function test_os()
     
     fd = os.open(fpath, os.O_RDWR | os.O_CREAT | os.O_TRUNC);
     assert(fd >= 0);
+    assert(os.isatty(fd), false);
     
     buf = new Uint8Array(10);
     for(i = 0; i < buf.length; i++)
@@ -184,7 +189,8 @@ function test_os()
     assert(err, 0);
     assert(files.indexOf(fname) >= 0);
 
-    fdate = 10000;
+    /* The Windows CRT can report -1 near the Unix epoch. */
+    fdate = os.platform == "win32" ? 946684800000 : 10000;
 
     err = os.utimes(fpath, fdate, fdate);
     assert(err, 0);
@@ -194,18 +200,20 @@ function test_os()
     assert(st.mode & os.S_IFMT, os.S_IFREG);
     assert(st.mtime, fdate);
 
-    err = os.symlink(fname, link_path);
-    assert(err === 0);
-    
-    [st, err] = os.lstat(link_path);
-    assert(err, 0);
-    assert(st.mode & os.S_IFMT, os.S_IFLNK);
+    if (os.platform != "win32") {
+        err = os.symlink(fname, link_path);
+        assert(err === 0);
 
-    [buf, err] = os.readlink(link_path);
-    assert(err, 0);
-    assert(buf, fname);
-    
-    assert(os.remove(link_path) === 0);
+        [st, err] = os.lstat(link_path);
+        assert(err, 0);
+        assert(st.mode & os.S_IFMT, os.S_IFLNK);
+
+        [buf, err] = os.readlink(link_path);
+        assert(err, 0);
+        assert(buf, fname);
+
+        assert(os.remove(link_path) === 0);
+    }
 
     [buf, err] = os.getcwd();
     assert(err, 0);
@@ -226,6 +234,15 @@ function test_os()
 function test_os_exec()
 {
     var ret, fds, pid, f, status;
+
+    if (os.platform == "win32") {
+        f = std.popen("cmd /c echo hello", "r");
+        assert(f.readAsString().trim(), "hello");
+        assert(f.close(), 0);
+        os.signal(os.SIGINT, function () { });
+        os.signal(os.SIGINT, null);
+        return;
+    }
 
     ret = os.exec(["true"]);
     assert(ret, 0);

@@ -541,7 +541,15 @@ int main(int argc, char **argv)
         p = strrchr(exename, '/');
         if (p)
             exename = p + 1;
+#ifdef _WIN32
+        p = strrchr(exename, '\\');
+        if (p)
+            exename = p + 1;
+        load_jscalc = !_stricmp(exename, "qjscalc") ||
+                      !_stricmp(exename, "qjscalc.exe");
+#else
         load_jscalc = !strcmp(exename, "qjscalc");
+#endif
     }
 #endif
     

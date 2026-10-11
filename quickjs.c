@@ -66,9 +66,16 @@
 #define MALLOC_OVERHEAD  8
 #endif
 
-#if !defined(_WIN32)
 /* define it if printf uses the RNDN rounding mode instead of RNDNA */
+#if !defined(_WIN32) || defined(_UCRT)
 #define CONFIG_PRINTF_RNDN
+#endif
+
+#if defined(_UCRT) && defined(__MINGW32__)
+/* MinGW's ANSI printf does not honor the floating point rounding mode. */
+#define js_dtoa_snprintf __ms_snprintf
+#else
+#define js_dtoa_snprintf snprintf
 #endif
 
 /* define to include Atomics.* operations which depend on the OS
@@ -11309,7 +11316,7 @@ static void js_ecvt1(double d, int n_digits, int *decpt, int *sign, char *buf,
 {
     if (rounding_mode != FE_TONEAREST)
         fesetround(rounding_mode);
-    snprintf(buf1, buf1_size, "%+.*e", n_digits - 1, d);
+    js_dtoa_snprintf(buf1, buf1_size, "%+.*e", n_digits - 1, d);
     if (rounding_mode != FE_TONEAREST)
         fesetround(FE_TONEAREST);
     *sign = (buf1[0] == '-');
@@ -11361,8 +11368,8 @@ static int js_ecvt(double d, int n_digits, int *decpt, int *sign, char *buf,
             int decpt1, sign1, decpt2, sign2;
             /* The JS rounding is specified as round to nearest ties away
                from zero (RNDNA), but in printf the "ties" case is not
-               specified (for example it is RNDN for glibc, RNDNA for
-               Windows), so we must round manually. */
+               specified (for example it is RNDN for glibc and UCRT),
+               so we must round manually. */
             js_ecvt1(d, n_digits + 1, &decpt1, &sign1, buf1, FE_TONEAREST,
                      buf_tmp, sizeof(buf_tmp));
             /* XXX: could use 2 digits to reduce the average running time */
@@ -11393,7 +11400,7 @@ static int js_fcvt1(char *buf, int buf_size, double d, int n_digits,
     int n;
     if (rounding_mode != FE_TONEAREST)
         fesetround(rounding_mode);
-    n = snprintf(buf, buf_size, "%.*f", n_digits, d);
+    n = js_dtoa_snprintf(buf, buf_size, "%.*f", n_digits, d);
     if (rounding_mode != FE_TONEAREST)
         fesetround(FE_TONEAREST);
     assert(n < buf_size);
@@ -11412,8 +11419,8 @@ static void js_fcvt(char *buf, int buf_size, double d, int n_digits)
 
         /* The JS rounding is specified as round to nearest ties away from
            zero (RNDNA), but in printf the "ties" case is not specified
-           (for example it is RNDN for glibc, RNDNA for Windows), so we
-           must round manually. */
+           (for example it is RNDN for glibc and UCRT), so we must round
+           manually. */
         n1 = js_fcvt1(buf1, sizeof(buf1), d, n_digits + 1, FE_TONEAREST);
         rounding_mode = FE_TONEAREST;
         /* XXX: could use 2 digits to reduce the average running time */
@@ -27254,6 +27261,43 @@ void JS_SetModuleLoaderFunc(JSRuntime *rt,
     rt->module_loader_opaque = opaque;
 }
 
+static char *js_module_path_sep(const char *path)
+{
+    char *p = strrchr(path, '/');
+#ifdef _WIN32
+    char *p1 = strrchr(path, '\\');
+
+    if (p1 && (!p || p1 > p))
+        p = p1;
+#endif
+    return p;
+}
+
+#ifdef _WIN32
+static BOOL js_module_path_is_root(const char *path)
+{
+    const char *p;
+
+    if (((path[0] >= 'A' && path[0] <= 'Z') ||
+         (path[0] >= 'a' && path[0] <= 'z')) &&
+        path[1] == ':' && path[2] == '\0')
+        return TRUE;
+    if ((path[0] == '/' || path[0] == '\\') &&
+        (path[1] == '/' || path[1] == '\\')) {
+        p = path + 2;
+        while (*p && *p != '/' && *p != '\\')
+            p++;
+        if (!*p)
+            return FALSE;
+        p++;
+        while (*p && *p != '/' && *p != '\\')
+            p++;
+        return *p == '\0';
+    }
+    return FALSE;
+}
+#endif
+
 /* default module filename normalizer */
 static char *js_default_module_normalize_name(JSContext *ctx,
                                               const char *base_name,
@@ -27268,7 +27312,23 @@ static char *js_default_module_normalize_name(JSContext *ctx,
         return js_strdup(ctx, name);
     }
 
-    p = strrchr(base_name, '/');
+#ifdef _WIN32
+    if (((base_name[0] >= 'A' && base_name[0] <= 'Z') ||
+         (base_name[0] >= 'a' && base_name[0] <= 'z')) &&
+        base_name[1] == ':' &&
+        base_name[2] != '/' && base_name[2] != '\\') {
+        p = js_module_path_sep(base_name);
+        len = p ? p - base_name + 1 : 2;
+        filename = js_malloc(ctx, len + strlen(name) + 1);
+        if (!filename)
+            return NULL;
+        memcpy(filename, base_name, len);
+        strcpy(filename + len, name);
+        return filename;
+    }
+#endif
+
+    p = js_module_path_sep(base_name);
     if (p)
         len = p - base_name;
     else
@@ -27290,7 +27350,13 @@ static char *js_default_module_normalize_name(JSContext *ctx,
                or ".." */
             if (filename[0] == '\0')
                 break;
-            p = strrchr(filename, '/');
+#ifdef _WIN32
+            if (js_module_path_is_root(filename)) {
+                r += 3;
+                continue;
+            }
+#endif
+            p = js_module_path_sep(filename);
             if (!p)
                 p = filename;
             else
